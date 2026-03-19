@@ -1,0 +1,15 @@
+{
+  "winner_type": "ensemble",
+  "ensemble_name": "weighted__catboost__eng_no_time=0.80__lightgbm__eng_no_time_knn=0.20__xgboost__eng_no_time_knn=0.00",
+  "members": [
+    "catboost__eng_no_time",
+    "lightgbm__eng_no_time_knn",
+    "xgboost__eng_no_time_knn"
+  ],
+  "weights": [
+    0.8,
+    0.2,
+    0.0
+  ],
+  "oof_auc": 0.7527207491976142
+}

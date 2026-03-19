@@ -14,6 +14,7 @@ import itertools
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.impute import KNNImputer
 
 warnings.filterwarnings("ignore")
 
@@ -144,6 +145,43 @@ def clean_data(dfin, assumption=True):
     df = clean_age(df)
     return df
 
+def impute_numeric_features(X_train, X_test, strategy="median"):
+    """
+    Impute numeric columns only, fit on train and apply to train/test.
+    
+    Parameters
+    ----------
+    X_train : pd.DataFrame
+    X_test : pd.DataFrame
+    strategy : str
+        One of: "none", "median", "knn"
+    
+    Returns
+    -------
+    X_train_out, X_test_out : pd.DataFrame
+    """
+    X_train = X_train.copy()
+    X_test = X_test.copy()
+
+    if strategy == "none":
+        return X_train, X_test
+
+    num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+
+    if len(num_cols) == 0:
+        return X_train, X_test
+
+    if strategy == "median":
+        imputer = SimpleImputer(strategy="median")
+    elif strategy == "knn":
+        imputer = KNNImputer(n_neighbors=5, weights="distance")
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    X_train[num_cols] = imputer.fit_transform(X_train[num_cols])
+    X_test[num_cols] = imputer.transform(X_test[num_cols])
+
+    return X_train, X_test
 
 # ============================================================
 # Feature engineering
@@ -337,27 +375,72 @@ def build_feature_sets(train_df, test_df, target_col=TARGET_COL):
 
     feature_sets = {}
 
-    # raw, but without application_month
-    X_train_raw = train_raw.drop(columns=[target_col, TIME_COL], errors="ignore")
-    X_test_raw = test_raw.drop(columns=[TIME_COL], errors="ignore")
+    drop_model_cols = [target_col, TIME_COL, ID_COL, "etl_batch_id", "schema_version"]
+    drop_test_cols = [TIME_COL, ID_COL, "etl_batch_id", "schema_version"]
+
+    # -------------------------
+    # Base raw features
+    # -------------------------
+    X_train_raw = train_raw.drop(columns=drop_model_cols, errors="ignore")
+    X_test_raw = test_raw.drop(columns=drop_test_cols, errors="ignore")
     X_train_raw, X_test_raw, dropped_raw = drop_constant_and_all_missing(X_train_raw, X_test_raw)
 
     feature_sets["raw_no_time"] = {
-        "X_train": X_train_raw,
-        "X_test": X_test_raw,
-        "dropped_columns": dropped_raw + [TIME_COL],
+        "X_train": X_train_raw.copy(),
+        "X_test": X_test_raw.copy(),
+        "dropped_columns": dropped_raw + [c for c in drop_model_cols if c != target_col],
+        "imputation": "none",
     }
 
-    # engineered, but without application_month
-    X_train_eng = train_eng.drop(columns=[target_col, TIME_COL], errors="ignore")
-    X_test_eng = test_eng.drop(columns=[TIME_COL], errors="ignore")
+    X_train_raw_med, X_test_raw_med = impute_numeric_features(X_train_raw, X_test_raw, strategy="median")
+    feature_sets["raw_no_time_median"] = {
+        "X_train": X_train_raw_med,
+        "X_test": X_test_raw_med,
+        "dropped_columns": dropped_raw + [c for c in drop_model_cols if c != target_col],
+        "imputation": "median",
+    }
+
+    X_train_raw_knn, X_test_raw_knn = impute_numeric_features(X_train_raw, X_test_raw, strategy="knn")
+    feature_sets["raw_no_time_knn"] = {
+        "X_train": X_train_raw_knn,
+        "X_test": X_test_raw_knn,
+        "dropped_columns": dropped_raw + [c for c in drop_model_cols if c != target_col],
+        "imputation": "knn",
+    }
+
+    # -------------------------
+    # Base engineered features
+    # -------------------------
+    X_train_eng = train_eng.drop(columns=drop_model_cols, errors="ignore")
+    X_test_eng = test_eng.drop(columns=drop_test_cols, errors="ignore")
     X_train_eng, X_test_eng, dropped_eng = drop_constant_and_all_missing(X_train_eng, X_test_eng)
 
     feature_sets["eng_no_time"] = {
-        "X_train": X_train_eng,
-        "X_test": X_test_eng,
-        "dropped_columns": dropped_eng + [TIME_COL],
+        "X_train": X_train_eng.copy(),
+        "X_test": X_test_eng.copy(),
+        "dropped_columns": dropped_eng + [c for c in drop_model_cols if c != target_col],
+        "imputation": "none",
     }
+
+    X_train_eng_med, X_test_eng_med = impute_numeric_features(X_train_eng, X_test_eng, strategy="median")
+    feature_sets["eng_no_time_median"] = {
+        "X_train": X_train_eng_med,
+        "X_test": X_test_eng_med,
+        "dropped_columns": dropped_eng + [c for c in drop_model_cols if c != target_col],
+        "imputation": "median",
+    }
+
+    X_train_eng_knn, X_test_eng_knn = impute_numeric_features(X_train_eng, X_test_eng, strategy="knn")
+    feature_sets["eng_no_time_knn"] = {
+        "X_train": X_train_eng_knn,
+        "X_test": X_test_eng_knn,
+        "dropped_columns": dropped_eng + [c for c in drop_model_cols if c != target_col],
+        "imputation": "knn",
+    }
+
+    print("Feature sets created:")
+    for k, v in feature_sets.items():
+        print(f"{k:20s} | train={v['X_train'].shape} | test={v['X_test'].shape} | imputation={v['imputation']}")
 
     return feature_sets
 
@@ -373,15 +456,20 @@ def make_ohe():
         return OneHotEncoder(handle_unknown="ignore", sparse=True)
 
 
-def make_ohe_preprocessor(X):
+def make_ohe_preprocessor(X, numeric_impute=True):
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
     num_cols = [c for c in X.columns if c not in cat_cols]
 
+    if numeric_impute:
+        num_transformer = Pipeline([
+            ("imputer", SimpleImputer(strategy="median"))
+        ])
+    else:
+        num_transformer = "passthrough"
+
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", Pipeline([
-                ("imputer", SimpleImputer(strategy="median"))
-            ]), num_cols),
+            ("num", num_transformer, num_cols),
             ("cat", Pipeline([
                 ("imputer", SimpleImputer(strategy="most_frequent")),
                 ("ohe", make_ohe())
@@ -472,7 +560,7 @@ def make_catboost_model():
 # CV runners
 # ============================================================
 
-def cv_pipeline_model(model_name, X, y, X_test):
+def cv_pipeline_model(model_name, X, y, X_test, numeric_already_imputed=False):
     if model_name == "lightgbm":
         model = make_lgbm_model()
     elif model_name == "xgboost":
@@ -480,7 +568,10 @@ def cv_pipeline_model(model_name, X, y, X_test):
     else:
         raise ValueError(f"Unsupported pipeline model: {model_name}")
 
-    preprocessor, num_cols, cat_cols = make_ohe_preprocessor(X)
+    preprocessor, num_cols, cat_cols = make_ohe_preprocessor(
+        X,
+        numeric_impute=not numeric_already_imputed
+    )
 
     pipe = Pipeline([
         ("prep", preprocessor),
@@ -519,7 +610,6 @@ def cv_pipeline_model(model_name, X, y, X_test):
         "oof_pred": oof_pred,
         "test_pred": test_pred,
     }
-
 
 def cv_catboost_model(X, y, X_test):
     cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
@@ -564,7 +654,7 @@ def cv_catboost_model(X, y, X_test):
 # Full-data fitting for final selected winner
 # ============================================================
 
-def fit_full_single_model(model_name, X, y, X_test):
+def fit_full_single_model(model_name, X, y, X_test, numeric_already_imputed=False):
     if model_name == "catboost":
         prepared, cat_cols = prepare_catboost_frames(X, [X_test])
         X_cb, X_test_cb = prepared
@@ -589,7 +679,10 @@ def fit_full_single_model(model_name, X, y, X_test):
         else:
             model = make_xgb_model(y)
 
-        preprocessor, num_cols, cat_cols = make_ohe_preprocessor(X)
+        preprocessor, num_cols, cat_cols = make_ohe_preprocessor(
+            X,
+            numeric_impute=not numeric_already_imputed
+        )
 
         pipe = Pipeline([
             ("prep", preprocessor),
@@ -611,7 +704,6 @@ def fit_full_single_model(model_name, X, y, X_test):
 
     else:
         raise ValueError(f"Unknown model_name={model_name}")
-
 
 # ============================================================
 # Ensemble search
@@ -739,8 +831,14 @@ def main():
     # ---------------------------
     base_rows = []
     base_store = {}
-
-    feature_set_names = ["raw_no_time", "eng_no_time"]
+    feature_set_names = [
+        "raw_no_time",
+        "raw_no_time_median",
+        "raw_no_time_knn",
+        "eng_no_time",
+        "eng_no_time_median",
+        "eng_no_time_knn",
+        ]
 
     for fs_name in feature_set_names:
         X = feature_sets[fs_name]["X_train"]
@@ -767,9 +865,11 @@ def main():
             })
             print(f"OOF AUC: {res['oof_auc']:.6f}")
 
+        numeric_already_imputed = feature_sets[fs_name]["imputation"] in {"median", "knn"}
+
         if LGBMClassifier is not None:
             print(f"\nRunning LightGBM on {fs_name} ...")
-            res = cv_pipeline_model("lightgbm", X, y, X_test)
+            res = cv_pipeline_model("lightgbm", X, y, X_test, numeric_already_imputed=numeric_already_imputed)
             run_key = f"lightgbm__{fs_name}"
             base_store[run_key] = {
                 "run_key": run_key,
@@ -790,7 +890,7 @@ def main():
 
         if XGBClassifier is not None:
             print(f"\nRunning XGBoost on {fs_name} ...")
-            res = cv_pipeline_model("xgboost", X, y, X_test)
+            res = cv_pipeline_model("xgboost", X, y, X_test, numeric_already_imputed=numeric_already_imputed)
             run_key = f"xgboost__{fs_name}"
             base_store[run_key] = {
                 "run_key": run_key,
@@ -903,13 +1003,15 @@ def main():
         X_full = feature_sets[fs_name]["X_train"]
         X_test_full = feature_sets[fs_name]["X_test"]
 
+        numeric_already_imputed = feature_sets[fs_name]["imputation"] in {"median", "knn"}
+
         best_artifact, final_test_pred = fit_full_single_model(
             model_name=model_type,
             X=X_full,
             y=y,
-            X_test=X_test_full
+            X_test=X_test_full,
+            numeric_already_imputed=numeric_already_imputed
         )
-
         meta = {
             "winner_type": "single",
             "run_key": run_key,
